@@ -97,6 +97,9 @@ class LLMVerdict(BaseModel):
     calls: List[SpeciesCall] = Field(default_factory=list)   # v1 เก่า ยังไม่ลบ
     merged_blob_ids: List[List[int]] = Field(default_factory=list)
     """ก้อนที่ CV แบ่งผิด LLM บอกว่าจริงๆ เป็นตัวเดียวกัน เช่น [[2,3]]"""
+    boxes: List[List[float]] = Field(default_factory=list)
+    """กรอบรายตัวจาก prompt v6 · [x1,y1,x2,y2] สเกล 0-1000 · ผ่าน client.valid_boxes แล้ว
+    เป็นข้อมูลตำแหน่งเท่านั้น จำนวนช้างมาจาก animals[].count ไม่ใช่จากจำนวนกรอบ"""
 
 
 # ---------------------------------------------------------------- response

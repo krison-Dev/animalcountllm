@@ -9,16 +9,50 @@ from __future__ import annotations
 import json
 import os
 import random
-import re
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from ..schemas import Blob, LLMVerdict, SpeciesTally
 from . import prompt_v2 as prompt
-from . import prompt_v4
+from . import prompt_v4, prompt_v5, prompt_v6
 
 VALID = {"elephant", "cattle", "human", "other_animal", "unknown"}
+
+# prompt ของเส้น llm · ค่าเริ่มต้น v5 (thermal กลางวัน/กลางคืน + ภาพสีจาก PTZ · ไม่มีกรอบ)
+# Toy สั่งถอดกรอบออก 2026-11-09 · v6 (= v5 + กรอบรายตัว) ยังเรียกได้ด้วย ELEPHANT_PROMPT=v6
+# ถอยกลับก่อนรองรับ PTZ: ELEPHANT_PROMPT=v4 · ทั้งหมดไม่ต้อง build ใหม่
+# ค่าที่ไม่รู้จักใช้ค่าเริ่มต้น ไม่ใช่พัง
+LOOK_PROMPTS = {"v4": prompt_v4, "v5": prompt_v5, "v6": prompt_v6}
+DEFAULT_LOOK = prompt_v5
+MAX_BOXES = 20
+
+
+def look_prompt():
+    return LOOK_PROMPTS.get(os.environ.get("ELEPHANT_PROMPT", "").strip().lower(), DEFAULT_LOOK)
+
+
+def valid_boxes(raw) -> List[List[float]]:
+    """กรอบ [x1,y1,x2,y2] สเกล 0-1000 ที่ใช้ได้ · ทิ้งที่ผิดรูปทีละกรอบ ไม่ทิ้งทั้งชุด
+
+    ผิดรูป = ไม่ใช่ตัวเลขสี่ตัว · เกิน 0-1000 · กลับด้านหรือแบนเป็นเส้น
+    🔴 ทิ้งกรอบ ≠ ทิ้งช้าง · จำนวนมาจาก animals[].count เสมอ ด่านนี้ไม่แตะจำนวน
+    ไม่หนีบค่าที่เกินให้เข้าขอบ เพราะกรอบที่ต้องหนีบคือกรอบที่โมเดลอ่านหน่วยผิด
+    หนีบแล้วจะได้กรอบที่ดูดีแต่ชี้ผิดที่
+    """
+    out: List[List[float]] = []
+    if not isinstance(raw, list):
+        return out
+    for b in raw[:MAX_BOXES]:
+        if not isinstance(b, (list, tuple)) or len(b) != 4:
+            continue
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in b):
+            continue
+        x1, y1, x2, y2 = (float(v) for v in b)
+        if not (0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000):
+            continue
+        out.append([x1, y1, x2, y2])
+    return out
 
 
 @dataclass
@@ -96,12 +130,18 @@ class VisionLLM:
 
         ตัดสินโดย Toy 2026-08-17: API เส้นนี้คือ LLM ไม่ใช่ CV
         Toy 2026-11-03: นับช้างอย่างเดียว ไม่สนใจคน (ดู prompt_v4.py)
+        2026-11-09: ค่าเริ่มต้นเป็น v5 (ดู prompt_v5.py) · ELEPHANT_PROMPT=v4 ถอยกลับ
         """
-        system, user = prompt_v4.build(w, h, camera_id)
+        p = look_prompt()
+        system, user = p.build(w, h, camera_id)
         res = self._invoke(system, user, image_b64, image_hash,
-                           prompt_v4.PROMPT_VERSION, blobs=0, frame=f"{w}x{h}")
+                           p.PROMPT_VERSION, blobs=0, frame=f"{w}x{h}")
         if res.verdict:
             res.verdict.animals = elephant_only(res.verdict.animals)
+            if not res.verdict.animals:
+                res.verdict.boxes = []   # ตัดคนออกหมดแล้วไม่เหลือสัตว์ = กรอบไม่ได้ชี้ช้าง
+            if p is not prompt_v6:
+                res.verdict.boxes = []   # กรอบมีเฉพาะตอนเปิด v6 · โมเดลพิมพ์มาเองก็ไม่ส่งต่อ
         return res
 
     def classify(self, image_b64: str, blobs: List[Blob], w: int, h: int,
@@ -194,33 +234,51 @@ def mime_of(image_b64: str) -> str:
     return "image/png"
 
 
+def first_json(text: str) -> Tuple[Optional[dict], Optional[str]]:
+    """JSON object ก้อนแรกในคำตอบ · ไม่สนข้อความที่ตามมาข้างหลัง
+
+    🔴 เจอจริง 2026-11-09 บน PGX · qwen3-vl-30b-a3b q8 ตอบ JSON ถูกต้องครบ
+    แล้วพิมพ์ต่อว่า "The image provided is not a thermal image ..." ซึ่งมีวงเล็บปีกกา
+    เดิมใช้ regex `\\{.*\\}` แบบโลภ กวาดจากปีกกาแรกถึงปีกกาสุดท้าย รวมข้อความท้ายเข้าไปด้วย
+    แล้ว json.loads ตก "Extra data" · เฟรมที่โมเดลตอบถูกกลายเป็น degraded ทั้งที่คำตอบอยู่ตรงนั้น
+    raw_decode อ่านก้อนเดียวแล้วหยุด เลยไม่สนว่าข้างหลังมีอะไร
+
+    🔴 ลองแค่ปีกกาตัวแรก ห้ามวนหาปีกกาตัวถัดไปเมื่อก้อนแรกพัง ตัวถัดไปคือก้อนข้างใน
+    เช่น {"species":"elephant",...} ซึ่งไม่มีคีย์ animals แล้วจะกลายเป็น "ไม่มีช้าง" เงียบๆ
+    ก้อนแรกพัง = degraded พร้อมเหตุผล ไม่ใช่ศูนย์ตัว
+    """
+    if not text:
+        return None, "empty response"
+    i = text.find("{")
+    if i < 0:
+        return None, "no JSON found"
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text, i)
+    except json.JSONDecodeError as e:
+        return None, f"bad JSON: {e}"
+    if not isinstance(data, dict):
+        return None, "bad JSON: not an object"
+    return data, None
+
+
 def image_type_of(text: str) -> Optional[str]:
     """ดึง image_type ที่โมเดลบอก · ไม่มีก็ None ไม่ใช่เรื่องผิดพลาด (v2 ไม่มีฟิลด์นี้)"""
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
+    data, _ = first_json(text or "")
+    if data is None:
         return None
-    try:
-        v = json.loads(m.group(0)).get("image_type")
-    except json.JSONDecodeError:
-        return None
+    v = data.get("image_type")
     v = str(v).lower().strip() if v is not None else None
     return v if v in {"thermal", "colour", "color", "unclear"} else None
 
 
 def parse(text: str) -> Tuple[Optional[LLMVerdict], Optional[str]]:
-    """แกะ JSON จากคำตอบ ทนกับ markdown fence และข้อความนำ
+    """แกะ JSON จากคำตอบ ทนกับ markdown fence ข้อความนำ และข้อความต่อท้าย
 
     โมเดลชอบห่อ JSON ด้วย ```json แม้จะสั่งว่าอย่าห่อ
     """
-    if not text:
-        return None, "empty response"
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return None, "no JSON found"
-    try:
-        data = json.loads(m.group(0))
-    except json.JSONDecodeError as e:
-        return None, f"bad JSON: {e}"
+    data, err = first_json(text)
+    if data is None:
+        return None, err
 
     animals = []
     for a in data.get("animals", []):
@@ -239,4 +297,7 @@ def parse(text: str) -> Tuple[Optional[LLMVerdict], Optional[str]]:
             continue
         animals.append(SpeciesTally(species=sp, count=n,
                                     confidence=max(0.0, min(1.0, conf))))
-    return LLMVerdict(animals=animals), None
+    # กรอบที่ลอยอยู่โดยไม่มีสัตว์สักตัวถูกนับ = คำตอบขัดกันเอง · ทิ้งกรอบ
+    # ไม่งั้นปลายทางเห็นกรอบบนภาพแล้วเข้าใจว่าเจอช้าง ทั้งที่ counts ว่าง
+    boxes = valid_boxes(data.get("boxes")) if animals else []
+    return LLMVerdict(animals=animals, boxes=boxes), None

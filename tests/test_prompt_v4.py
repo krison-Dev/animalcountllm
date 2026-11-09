@@ -35,7 +35,8 @@ def test_ด่านในโค้ด_ตัดคน_สัตว์อื่
         ("elephant", 1, 0.9), ("unknown", 1, 0.2)]
 
 
-def test_look_ใช้_v4_และผ่านด่าน(monkeypatch):
+def test_look_ถอยกลับ_v4_ได้ด้วย_env_และผ่านด่าน(monkeypatch):
+    """ค่าเริ่มต้นเป็น v5 ตั้งแต่ 2026-11-09 · v4 ยังต้องเรียกได้เพื่อถอยกลับโดยไม่ build ใหม่"""
     seen = {}
 
     def fake(self, system, user, image_b64, image_hash, prompt_version, blobs, frame):
@@ -43,6 +44,7 @@ def test_look_ใช้_v4_และผ่านด่าน(monkeypatch):
         return LLMResult(LLMVerdict(animals=[_t("human", 2)]), "raw", "stop", 1, 1.0)
 
     monkeypatch.setattr(VisionLLM, "_invoke", fake)
+    monkeypatch.setenv("ELEPHANT_PROMPT", "v4")
     res = VisionLLM().look("x", 10, 10)
     assert seen["version"] == "v4"
     assert res.verdict.animals == []
